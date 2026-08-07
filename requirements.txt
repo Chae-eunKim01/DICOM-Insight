@@ -1,0 +1,12 @@
+PySide6>=6.7
+pydicom>=3.0
+numpy>=1.26
+SimpleITK>=2.4
+vtk>=9.3
+pylibjpeg>=2.0
+pylibjpeg-libjpeg>=2.3
+pylibjpeg-openjpeg>=2.4
+pylibjpeg-rle>=2.0
+pyjpegls>=1.5
+pyinstaller>=6.10
+scipy>=1.11
