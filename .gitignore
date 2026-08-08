@@ -6,3 +6,5 @@ dist/
 *.spec
 .idea/
 .vscode/
+
+installer/
