@@ -1,7 +1,8 @@
+import os
 from pathlib import Path
 from time import perf_counter
-from PySide6.QtCore import Qt,QSettings,QTimer
-from PySide6.QtGui import QAction,QActionGroup
+from PySide6.QtCore import Qt,QSettings,QTimer,QThread
+from PySide6.QtGui import QAction,QActionGroup,QShortcut,QKeySequence
 from PySide6.QtWidgets import (
     QApplication,QMainWindow,QFileDialog,QSplitter,QWidget,QVBoxLayout,QHBoxLayout,
     QLabel,QStatusBar,QMessageBox,QPushButton,QCheckBox,QFrame,QMenu,QProgressBar,QDialog,QDialogButtonBox,QFormLayout,QDoubleSpinBox,QScrollBar
@@ -11,10 +12,12 @@ from ui.metadata_panel import MetadataPanel
 from ui.theme import LIGHT_STYLE,DARK_STYLE
 from viewer.viewer2d import DicomViewer2D
 from viewer.viewer3d import Viewer3DDialog
-from dicom.volume_builder import inspect_series_resolution
-from dicom.scanner import list_candidate_files
-from dicom.indexer import build_index_fast
+from dicom.volume_builder import inspect_series_resolution,build_volume_from_paths
+from dicom.import_worker import ImportWorker
 from dicom.loader import load_series
+
+def _path_key(path):
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
 from dicom.pixel_decoder import is_color_dataset
 from utils.constants import APP_NAME
 
@@ -31,6 +34,9 @@ class MainWindow(QMainWindow):
         self.progress_started_at=None
         self._last_progress_ui_at=0.0
         self._pending_slice_index=None
+        self._import_thread=None
+        self._import_worker=None
+        self._import_preview_path=""
 
         self.slice_scroll_timer=QTimer(self)
         self.slice_scroll_timer.setSingleShot(True)
@@ -42,6 +48,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._create_menu()
         self._connect_signals()
+        self._setup_slice_shortcuts()
         self._load_theme()
 
     def _build_ui(self):
@@ -108,7 +115,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.left_title)
 
         self.expand_all_checkbox=QCheckBox("Expand all by default")
-        self.expand_all_checkbox.setChecked(True)
+        self.expand_all_checkbox.setChecked(False)
         left_layout.addWidget(self.expand_all_checkbox)
 
         self.file_count_label=QLabel("0 DICOM files")
@@ -281,6 +288,22 @@ class MainWindow(QMainWindow):
             self.series_tree.select_file_path
         )
 
+    def _setup_slice_shortcuts(self):
+        self.slice_up_shortcut=QShortcut(QKeySequence(Qt.Key_Up),self)
+        self.slice_down_shortcut=QShortcut(QKeySequence(Qt.Key_Down),self)
+        self.slice_up_shortcut.setContext(Qt.WindowShortcut)
+        self.slice_down_shortcut.setContext(Qt.WindowShortcut)
+        self.slice_up_shortcut.activated.connect(lambda:self._change_slice_by_keyboard(-1))
+        self.slice_down_shortcut.activated.connect(lambda:self._change_slice_by_keyboard(1))
+
+    def _change_slice_by_keyboard(self,step):
+        if not self.viewer.series_paths:
+            return
+        target=self.viewer.index+int(step)
+        target=max(0,min(target,len(self.viewer.series_paths)-1))
+        if target!=self.viewer.index:
+            self.viewer.set_slice(target)
+
     def _load_theme(self):
         theme=self.settings.value("theme","light")
         if theme not in ("light","dark"):
@@ -297,10 +320,11 @@ class MainWindow(QMainWindow):
             self.setStyleSheet(LIGHT_STYLE)
             self.light_action.setChecked(True)
             self.dark_action.setChecked(False)
-            self.viewer.setBackgroundBrush(Qt.white)
+            self.viewer.setBackgroundBrush(Qt.black)
 
         self.left_title.setStyleSheet("font-size:18px;")
         self.right_title.setStyleSheet("font-size:18px;")
+        self.series_tree.set_theme(theme)
 
         if save:
             self.settings.setValue("theme",theme)
@@ -435,93 +459,69 @@ class MainWindow(QMainWindow):
         )
 
     def open_3d_viewer(self,mode):
-        paths=list(
-            getattr(self.viewer,"series_paths",[]) or []
-        )
-
+        paths=list(getattr(self.viewer,"series_paths",[]) or [])
         if not paths:
-            QMessageBox.information(
-                self,
-                "3D Viewer",
-                "먼저 DICOM Series를 불러와 주세요."
-            )
+            QMessageBox.information(self,"3D Viewer","먼저 DICOM Series를 불러와 주세요.")
             return
 
-        self._start_progress("Preparing 3D")
+        cache_key=tuple(paths)
+        volume_info=getattr(self,"_volume_cache_info",None)
+        if getattr(self,"_volume_cache_key",None)!=cache_key:
+            volume_info=None
 
-        def load_cb(current,total):
-            self._update_progress(
-                current,
-                total,
-                "Preparing 3D",
-                f"{current} loaded"
+        if volume_info is None:
+            self._start_progress("Preparing 3D")
+            started=perf_counter()
+
+            def load_cb(current,total):
+                self._update_progress(current,total,"Preparing 3D",f"{current} / {total}")
+
+            try:
+                volume_info=build_volume_from_paths(paths,progress_callback=load_cb)
+            except Exception as e:
+                self._finish_progress()
+                QMessageBox.critical(self,"3D Viewer Error",str(e))
+                return
+
+            elapsed=perf_counter()-started
+            self._volume_cache_key=cache_key
+            self._volume_cache_info=volume_info
+            self._finish_progress()
+            backend=volume_info.get("backend","3D")
+            self.statusBar().showMessage(
+                f"3D volume ready | {len(paths)} slices | {elapsed:.2f}s | {backend}",
+                7000
             )
 
-        datasets=load_series(
-            paths,
-            progress_callback=load_cb
-        )
-
-        self._finish_progress()
-
-        if not datasets:
-            QMessageBox.warning(
-                self,
-                "3D Viewer",
-                "3D 재구성을 위한 Series를 불러오지 못했습니다."
-            )
-            return
-
-        resolution=inspect_series_resolution(datasets)
+        resolution=inspect_series_resolution(volume_info)
         low_resolution=resolution["low_resolution"]
 
         if low_resolution:
             st=resolution["slice_thickness"]
             zs=resolution["slice_spacing"]
             count=resolution["slice_count"]
-
             message=QMessageBox(self)
             message.setIcon(QMessageBox.Warning)
             message.setWindowTitle("Low-resolution 3D source")
-            message.setText(
-                "현재 Series는 Slice 간격이 두꺼워 "
-                "고품질 3D 재구성에 제한이 있습니다."
-            )
+            message.setText("현재 Series는 Slice 간격이 두꺼워 고품질 3D 재구성에 제한이 있습니다.")
             message.setInformativeText(
-                f"Images: {count}\n"
-                f"Slice Thickness: {st:.2f} mm\n"
-                f"Z Spacing: {zs:.2f} mm\n\n"
-                "MPR / MIP / Volume Rendering은 가능하지만 "
-                "Coronal, Sagittal 및 3D 표면에서 계단 현상이나 "
-                "뭉개짐이 보일 수 있습니다.\n\n"
-                "Low-resolution mode로 계속 여시겠습니까?"
+                f"Images: {count}\nSlice Thickness: {st:.2f} mm\nZ Spacing: {zs:.2f} mm\n\n"
+                "MPR / MIP / Volume Rendering은 가능하지만 Coronal, Sagittal 및 3D 표면에서 "
+                "계단 현상이나 뭉개짐이 보일 수 있습니다.\n\nLow-resolution mode로 계속 여시겠습니까?"
             )
-
-            continue_btn=message.addButton(
-                "Open Low-resolution 3D",
-                QMessageBox.AcceptRole
-            )
+            continue_btn=message.addButton("Open Low-resolution 3D",QMessageBox.AcceptRole)
             message.addButton(QMessageBox.Cancel)
             message.exec()
-
             if message.clickedButton() is not continue_btn:
                 return
 
         try:
             dialog=Viewer3DDialog(
-                datasets=datasets,
-                parent=self,
-                mode=mode,
-                low_resolution=low_resolution
+                datasets=None,parent=self,mode=mode,low_resolution=low_resolution,volume_info=volume_info
             )
             dialog.exec()
-
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "3D Viewer Error",
-                str(e)
-            )
+            QMessageBox.critical(self,"3D Viewer Error",str(e))
 
     def open_dicom(self):
         files,_=QFileDialog.getOpenFileNames(
@@ -539,47 +539,81 @@ class MainWindow(QMainWindow):
             self.import_paths([folder])
 
     def import_paths(self,items):
-        candidate_files=[]
-
-        # 1) 파일 목록 수집: pydicom read 없이 OS directory entry만 빠르게 순회
-        for item in items:
-            path=Path(item)
-
-            if path.is_dir():
-                self.path_label.setText(str(path))
-                self._start_progress(f"Listing files: {path}")
-                candidate_files.extend(list_candidate_files(str(path)))
-
-            elif path.is_file():
-                candidate_files.append(str(path))
-
-        candidate_files=list(dict.fromkeys(candidate_files))
-
-        if not candidate_files:
-            self._finish_progress()
-            QMessageBox.information(
-                self,
-                "DICOM",
-                "선택한 항목에서 파일을 찾지 못했습니다."
-            )
+        if self._import_thread is not None and self._import_thread.isRunning():
+            self.statusBar().showMessage("DICOM import is already running",3000)
             return
 
-        # 2) DICOM 판별 + Tree Indexing을 한 번의 header read로 통합
-        self._start_progress("Scanning & Indexing DICOM")
+        items=[str(item) for item in items if str(item)]
+        if not items:
+            return
 
-        def fast_index_cb(current,total,dicom_count):
-            self._update_progress(
-                current,
-                total,
-                "Scanning & Indexing",
-                f"{dicom_count} DICOM"
-            )
+        if len(items)==1:
+            self.path_label.setText(items[0])
+        else:
+            self.path_label.setText(f"{len(items)} items dropped / selected")
 
-        index,info,files=build_index_fast(
-            candidate_files,
-            progress_callback=fast_index_cb
+        self._import_preview_path=""
+        self.progress_started_at=perf_counter()
+        self.progress_text.setText("Scanning files...")
+        self.progress_text.setVisible(True)
+        self.progress_bar.setRange(0,0)
+        self.progress_bar.setVisible(True)
+        QApplication.processEvents()
+
+        thread=QThread(self)
+        worker=ImportWorker(items)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.scan_progress.connect(self._on_import_scan_progress)
+        worker.indexing_started.connect(self._on_import_indexing_started)
+        worker.index_progress.connect(self._on_import_index_progress)
+        worker.finished.connect(self._on_import_finished)
+        worker.failed.connect(self._on_import_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+
+        self._import_thread=thread
+        self._import_worker=worker
+        thread.start()
+
+    def _on_import_scan_progress(self,count):
+        self.progress_text.setText(f"Scanning files... {count}")
+
+    def _on_import_indexing_started(self,total):
+        self.progress_started_at=perf_counter()
+        self._last_progress_ui_at=0.0
+        self.progress_bar.setRange(0,100)
+        self.progress_bar.setValue(0)
+        self.progress_text.setText(f"Scanning & Indexing 0 / {total} | 0%")
+
+    def _on_import_index_progress(self,current,total,dicom_count):
+        self._update_progress(
+            current,
+            total,
+            "Scanning & Indexing",
+            f"{dicom_count} DICOM"
         )
 
+    def _series_containing_path(self,index,target_path):
+        if not target_path:
+            return None
+
+        target=_path_key(target_path)
+
+        for studies in index.values():
+            for series_map in studies.values():
+                for paths in series_map.values():
+                    for path in paths:
+                        if _path_key(path)==target:
+                            return paths
+        return None
+
+    def _on_import_finished(self,index,info,files,preview_path,metrics):
         if not files or not index:
             self._finish_progress()
             QMessageBox.information(
@@ -589,14 +623,12 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.current_paths=files
+        self.current_paths=list(files)
+        ui_start=perf_counter()
 
         self.series_tree.setUpdatesEnabled(False)
         try:
             self.series_tree.populate(index,info)
-
-            # Expanding every file node defeats lazy tree construction.
-            # Keep patient/study visible; Series file children build on demand.
             if self.expand_all_checkbox.isChecked():
                 self.series_tree.expandToDepth(2)
             else:
@@ -604,19 +636,49 @@ class MainWindow(QMainWindow):
         finally:
             self.series_tree.setUpdatesEnabled(True)
 
+        tree_time=perf_counter()-ui_start
         self.file_count_label.setText(f"{len(files)} DICOM files")
 
-        if len(items)==1:
-            self.path_label.setText(str(items[0]))
-        else:
-            self.path_label.setText(f"{len(items)} items dropped / selected")
+        try:
+            scan_time=float(metrics.get("scan",0.0))
+            index_time=float(metrics.get("index",0.0))
+            total_time=float(metrics.get("total",0.0))
+        except Exception:
+            pass
 
-        first_series=self.series_tree.select_first_series()
+        first_load_start=perf_counter()
+        first_series=self._series_containing_path(
+            index,
+            preview_path
+        )
+        if first_series is None:
+            first_series=self.series_tree.select_first_series()
 
         if first_series:
-            self.load_series(first_series)
+            self.load_series(
+                first_series,
+                start_file_path=preview_path
+            )
+            self.series_tree.expand_series_by_paths(first_series)
+            first_image_time=perf_counter()-first_load_start
+            ui_time=perf_counter()-ui_start
+            try:
+                self.statusBar().showMessage(
+                    f"Ready {len(files)} DICOM | Scan {scan_time:.2f}s | Index {index_time:.2f}s | Tree {tree_time:.2f}s | First image {first_image_time:.2f}s | UI {ui_time:.2f}s",
+                    10000
+                )
+            except Exception:
+                pass
         else:
             self._finish_progress("Ready")
+
+    def _on_import_failed(self,message):
+        self._finish_progress()
+        QMessageBox.critical(self,"DICOM Import Error",message)
+
+    def _on_import_thread_finished(self):
+        self._import_thread=None
+        self._import_worker=None
 
 
     def load_series(self,paths,start_file_path=None):
@@ -630,18 +692,10 @@ class MainWindow(QMainWindow):
         start_index=0
 
         if start_file_path:
-            try:
-                target=str(Path(start_file_path).resolve()).lower()
-            except Exception:
-                target=str(start_file_path).lower()
+            target=_path_key(start_file_path)
 
             for idx,path in enumerate(paths):
-                try:
-                    current=str(Path(path).resolve()).lower()
-                except Exception:
-                    current=str(path).lower()
-
-                if current==target:
+                if _path_key(path)==target:
                     start_index=idx
                     break
 

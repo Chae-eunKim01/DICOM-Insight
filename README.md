@@ -1,3 +1,11 @@
+
+## v1.0.1 Progressive Import
+- Drag & Drop / Open Folder scanning and DICOM indexing now run in a background QThread.
+- The first valid DICOM is opened as soon as it is discovered instead of waiting for the entire folder to finish indexing.
+- File discovery is streamed with `iter_candidate_files()` instead of building the full list on the UI thread.
+- After background indexing completes, the DICOM Tree is populated and the previewed image is replaced by its complete Series while preserving the current file.
+- Scanning uses an indeterminate progress state, then switches to percentage/ETA during header indexing.
+
 # Python DICOM Viewer - Dicron Style v0.2
 
 ## UI 변경
@@ -938,3 +946,46 @@ Tag가 DICOM에 없으면 Value는 빈 값으로 표시됩니다.
 - (0008,0032) Acquisition Time
 
 `Show all tags`를 체크하지 않은 상태에서도 표시됩니다.
+
+## v1.0.2 Fast Index
+- Added a lightweight binary DICOM header reader for common Explicit/Implicit VR transfer syntaxes.
+- Falls back to pydicom automatically for unusual or unsupported DICOM files.
+- Reduced header-indexing overhead while preserving Patient/Study/Series/Instance and geometry sorting metadata.
+- SQLite cache writes now run after indexing in a background thread so cache persistence does not delay UI readiness.
+- Reduced progress-signal frequency and tuned header-reader worker count for lower contention.
+- Import status now reports Scan / Index / Total elapsed time for performance verification.
+
+
+## v1.0.3 Fast Complete Import
+
+- DICOM 영상은 Scanning & Indexing이 모두 완료된 뒤 표시됩니다.
+- Import 단계에서는 Image Position/Orientation을 읽지 않고 Instance Number 중심으로 Series를 정렬합니다.
+- Geometry 정보는 실제 Series/MPR 로딩 단계에서 읽습니다.
+- Fast Header initial read size를 64 KiB에서 16 KiB로 줄여 대량 DICOM 폴더의 디스크 읽기량을 줄였습니다.
+- 대량 파일에서 Header worker 수를 최대 32개까지 사용하도록 조정했습니다.
+- Import progress UI 갱신 빈도를 줄여 대량 파일 처리 중 UI signal overhead를 낮췄습니다.
+
+## v1.0.4 Native-Style Fast Index
+
+- Import indexing no longer uses pydicom.
+- First-pass SQLite header-cache lookup/write was removed from the import path.
+- DICOM Patient/Study/Series/Instance tags are extracted by a lightweight binary index reader.
+- The common case reads only the first 64 KiB of each file; unusual headers expand to 256 KiB and then 1 MiB only when required.
+- Pixel Data is never decoded during indexing. pydicom remains in use for actual image loading and metadata display after indexing is complete.
+- The UI still waits until Scanning and Indexing are fully complete before showing the first image.
+
+## v1.0.5 Fast Tree Render
+- Initial import no longer creates every DICOM instance `QTreeWidgetItem`.
+- DICOM instance rows are created only when a Series node is expanded.
+- Removed filesystem-resolving `Path.resolve()` calls from hot UI paths; path comparison now uses `abspath` + `normcase`.
+- `QTreeWidget` uses uniform row heights and avoids continuous `ResizeToContents` recalculation.
+- `Expand all by default` is disabled by default to keep initial display fast.
+- Status bar reports Scan, Index, Tree, First image and total UI timing separately.
+
+## v1.0.8 - Fast 3D Load
+- MPR/MIP/Volume Rendering volume load uses SimpleITK/GDCM native series reader first, with parallel pydicom fallback.
+- Removed duplicate full-series pydicom read + deferred pixel re-read path for 3D.
+- MPR and slab MIP no longer initialize VTK or perform isotropic resampling on startup.
+- VTK is initialized only when Volume Rendering is selected.
+- VTK volume transfer uses zero-copy NumPy wrapping where possible.
+- Reuses the built 3D volume when reopening MPR/MIP/Volume Rendering for the same series.

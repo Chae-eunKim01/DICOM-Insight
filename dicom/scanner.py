@@ -31,9 +31,7 @@ def _is_candidate_filename(name):
 
     return True
 
-def list_candidate_files(folder):
-    result=[]
-    append=result.append
+def iter_candidate_files(folder):
     stack=[os.fspath(folder)]
     stack_append=stack.append
     stack_pop=stack.pop
@@ -55,12 +53,11 @@ def list_candidate_files(folder):
                         if not _is_candidate_filename(entry.name):
                             continue
 
-                        append(entry.path)
-
+                        yield entry.path
                     except OSError:
                         continue
-
         except OSError:
             continue
 
-    return result
+def list_candidate_files(folder):
+    return list(iter_candidate_files(folder))

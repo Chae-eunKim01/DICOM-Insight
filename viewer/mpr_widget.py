@@ -17,6 +17,7 @@ class MPRView(QWidget):
         self.panel=panel
         self.orientation=orientation
         self.drag_axis=None
+        self.drag_crosshair=False
         self.setMouseTracking(True)
         self.setMinimumSize(280,280)
 
@@ -182,6 +183,24 @@ class MPRView(QWidget):
             return ("sagittal","axial")
         return ("coronal","axial")
 
+    def _crosshair_center_screen(self,rect):
+        if self.orientation=="axial":
+            x=self._index_to_screen("sagittal",self.panel.index["sagittal"],rect)
+            y=self._index_to_screen("coronal",self.panel.index["coronal"],rect)
+        elif self.orientation=="coronal":
+            x=self._index_to_screen("sagittal",self.panel.index["sagittal"],rect)
+            y=self._index_to_screen("axial",self.panel.index["axial"],rect)
+        else:
+            x=self._index_to_screen("coronal",self.panel.index["coronal"],rect)
+            y=self._index_to_screen("axial",self.panel.index["axial"],rect)
+        return x,y
+
+    def _near_crosshair_center(self,pos,rect,tolerance=12.0):
+        x,y=self._crosshair_center_screen(rect)
+        dx=pos.x()-x
+        dy=pos.y()-y
+        return dx*dx+dy*dy<=tolerance*tolerance
+
     def _boundary_positions(self,axis,rect):
         center=self.panel.index[axis]
         half=self._slab_half_count(axis)
@@ -290,9 +309,18 @@ class MPRView(QWidget):
                     return
 
         self.panel.move_crosshair(self.orientation,event.position(),rect)
+        self.drag_crosshair=True
+        self.setCursor(Qt.ClosedHandCursor)
         event.accept()
 
     def mouseMoveEvent(self,event):
+        if self.drag_crosshair:
+            rect=self._target_rect()
+            if rect.contains(event.position()):
+                self.panel.move_crosshair(self.orientation,event.position(),rect)
+            event.accept()
+            return
+
         if self.drag_axis is not None:
             rect=self._target_rect()
             idx=self._screen_to_index(self.drag_axis,event.position(),rect)
@@ -306,11 +334,19 @@ class MPRView(QWidget):
             event.accept()
             return
 
+        self.unsetCursor()
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self,event):
+        if not self.drag_crosshair and self.drag_axis is None:
+            self.unsetCursor()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self,event):
         if event.button()==Qt.LeftButton:
             self.drag_axis=None
+            self.drag_crosshair=False
+            self.unsetCursor()
         super().mouseReleaseEvent(event)
 
 
@@ -349,19 +385,6 @@ class MPRPanel(QWidget):
         self.mode_combo.currentTextChanged.connect(self.set_mode)
         controls.addWidget(self.mode_combo)
 
-        controls.addWidget(QLabel("Quality"))
-        self.quality_combo=QComboBox()
-        self.quality_combo.addItems([
-            "Auto",
-            "Original",
-            "0.7 mm Isotropic",
-            "1.0 mm Isotropic",
-            "1.5 mm Isotropic",
-            "2.0 mm Isotropic"
-        ])
-        self.quality_combo.currentTextChanged.connect(self.set_quality)
-        controls.addWidget(self.quality_combo)
-
         self.auto_quality_label=QLabel()
         controls.addWidget(self.auto_quality_label)
 
@@ -386,10 +409,7 @@ class MPRPanel(QWidget):
 
         self.update_slab_label()
 
-        self.quality_combo.blockSignals(True)
-        self.quality_combo.setCurrentText("Auto")
-        self.quality_combo.blockSignals(False)
-        self.set_quality("Auto")
+        self.apply_auto_quality()
 
     def axis_size(self,axis):
         if axis=="axial":
@@ -417,60 +437,29 @@ class MPRPanel(QWidget):
             return 1.5
         return 2.0
 
-    def set_quality(self,text):
-        if text=="Original":
+    def apply_auto_quality(self):
+        target=self._auto_target_spacing()
+        self.auto_quality_label.setText(f"Auto → {target:.1f} mm isotropic")
+
+        try:
+            self.setCursor(Qt.WaitCursor)
+            volume,spacing=resample_volume_isotropic(
+                self.original_volume,
+                self.original_spacing,
+                target_spacing=target
+            )
+            self.volume=volume
+            self.spacing=spacing
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "MPR Resampling Error",
+                str(e)
+            )
             self.volume=self.original_volume
             self.spacing=self.original_spacing
-            self.auto_quality_label.setText("")
-
-        else:
-            if text=="Auto":
-                target=self._auto_target_spacing()
-                self.auto_quality_label.setText(
-                    f"Auto → {target:.1f} mm isotropic"
-                )
-            elif text.startswith("0.7"):
-                target=0.7
-                self.auto_quality_label.setText("")
-            elif text.startswith("1.0"):
-                target=1.0
-                self.auto_quality_label.setText("")
-            elif text.startswith("1.5"):
-                target=1.5
-                self.auto_quality_label.setText("")
-            else:
-                target=2.0
-                self.auto_quality_label.setText("")
-
-            try:
-                self.setCursor(Qt.WaitCursor)
-
-                volume,spacing=resample_volume_isotropic(
-                    self.original_volume,
-                    self.original_spacing,
-                    target_spacing=target
-                )
-
-                self.volume=volume
-                self.spacing=spacing
-
-            except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    "MPR Resampling Error",
-                    str(e)
-                )
-
-                self.quality_combo.blockSignals(True)
-                self.quality_combo.setCurrentText("Original")
-                self.quality_combo.blockSignals(False)
-
-                self.volume=self.original_volume
-                self.spacing=self.original_spacing
-                self.auto_quality_label.setText("")
-
-            finally:
-                self.unsetCursor()
+        finally:
+            self.unsetCursor()
 
         z,y,x=self.volume.shape
         self.index={
@@ -487,7 +476,6 @@ class MPRPanel(QWidget):
 
         self.update_slab_label()
         self.update_all()
-
 
     def set_mode(self,mode):
         self.mode=mode

@@ -6,5 +6,4 @@ dist/
 *.spec
 .idea/
 .vscode/
-
-installer/
+installer/*.exe

@@ -20,15 +20,8 @@ from viewer.mpr_widget import MPRPanel
 
 
 class Viewer3DDialog(QDialog):
-    def __init__(self,datasets,parent=None,mode="MPR",low_resolution=False):
+    def __init__(self,datasets=None,parent=None,mode="MPR",low_resolution=False,volume_info=None):
         super().__init__(parent)
-
-        if not VTK_AVAILABLE:
-            raise RuntimeError(
-                "VTK is not installed.\n\n"
-                "Install it with:\n"
-                "pip install vtk"
-            )
 
         self.low_resolution=bool(low_resolution)
         self.setWindowTitle(
@@ -38,7 +31,7 @@ class Viewer3DDialog(QDialog):
         )
         self.resize(1500,900)
 
-        self.volume_info=build_volume(datasets)
+        self.volume_info=volume_info if volume_info is not None else build_volume(datasets or [])
         self.volume=self.volume_info["volume"]
         self.spacing=self.volume_info["spacing"]
         self.original_volume=self.volume
@@ -58,7 +51,7 @@ class Viewer3DDialog(QDialog):
 
         st=self.volume_info.get("slice_thickness",0.0)
         zs=self.volume_info.get("slice_spacing",0.0)
-        count=self.volume_info.get("slice_count",len(datasets))
+        count=self.volume_info.get("slice_count",len(datasets or []))
 
         self.quality_label=QLabel(
             (
@@ -142,34 +135,45 @@ class Viewer3DDialog(QDialog):
         )
         self.stack.addWidget(self.mpr_panel)
 
-        # VTK canvas for rotating MIP and volume rendering
-        self.vtk_widget=QVTKRenderWindowInteractor(self)
-        self.render_window=self.vtk_widget.GetRenderWindow()
-        self.renderer=vtk.vtkRenderer()
-        self.renderer.SetBackground(0.0,0.0,0.0)
-        self.render_window.AddRenderer(self.renderer)
-        self.interactor=self.render_window.GetInteractor()
-        self.stack.addWidget(self.vtk_widget)
+        # VTK is expensive to initialize. Create it only when Volume Rendering is opened.
+        self.vtk_widget=None
+        self.render_window=None
+        self.renderer=None
+        self.interactor=None
+        self._vtk_numpy_ref=None
 
         layout=QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.mip_controls)
         layout.addWidget(self.stack,1)
 
-        self.image_data=self._to_vtk_image(self.volume,self.spacing)
+        self.image_data=None
         self.current_volume=None
         self.current_mapper=None
         self.current_mip_property=None
-        self.render_window.SetMultiSamples(8)
 
-        self.interactor.Initialize()
-
+        # MPR and slab MIP use the original volume directly. Do not perform an
+        # expensive isotropic resample or VTK deep copy during dialog startup.
         self.mip_quality_combo.blockSignals(True)
-        self.mip_quality_combo.setCurrentText("Auto")
+        self.mip_quality_combo.setCurrentText("Original")
         self.mip_quality_combo.blockSignals(False)
-        self._change_mip_quality("Auto",render=False)
 
         self.set_mode(mode)
+
+    def _ensure_vtk(self):
+        if self.vtk_widget is not None:
+            return
+        if not VTK_AVAILABLE:
+            raise RuntimeError("VTK is not installed.\n\nInstall it with:\npip install vtk")
+        self.vtk_widget=QVTKRenderWindowInteractor(self)
+        self.render_window=self.vtk_widget.GetRenderWindow()
+        self.renderer=vtk.vtkRenderer()
+        self.renderer.SetBackground(0.0,0.0,0.0)
+        self.render_window.AddRenderer(self.renderer)
+        self.interactor=self.render_window.GetInteractor()
+        self.render_window.SetMultiSamples(0)
+        self.stack.addWidget(self.vtk_widget)
+        self.interactor.Initialize()
 
     def _to_vtk_image(self,volume,spacing):
         z,y,x=volume.shape
@@ -182,13 +186,11 @@ class Viewer3DDialog(QDialog):
         )
         image.SetOrigin(0.0,0.0,0.0)
 
-        flat=np.ascontiguousarray(
-            volume,dtype=np.float32
-        ).ravel(order="C")
-
+        flat=np.ascontiguousarray(volume,dtype=np.float32).ravel(order="C")
+        self._vtk_numpy_ref=flat
         vtk_array=numpy_support.numpy_to_vtk(
             num_array=flat,
-            deep=True,
+            deep=False,
             array_type=vtk.VTK_FLOAT
         )
         image.GetPointData().SetScalars(vtk_array)
@@ -256,10 +258,9 @@ class Viewer3DDialog(QDialog):
             finally:
                 self.unsetCursor()
 
-        self.image_data=self._to_vtk_image(
-            self.mip_volume,
-            self.mip_spacing
-        )
+        if render and self.mode_combo.currentText()=="MIP":
+            self._ensure_vtk()
+            self.image_data=self._to_vtk_image(self.mip_volume,self.mip_spacing)
 
         if render and self.mode_combo.currentText()=="MIP":
             self.renderer.RemoveAllViewProps()
@@ -337,6 +338,7 @@ class Viewer3DDialog(QDialog):
             self.mpr_panel.set_mode("MIP Slab")
             return
 
+        self._ensure_vtk()
         self.stack.setCurrentWidget(self.vtk_widget)
         self.renderer.RemoveAllViewProps()
         self.image_data=self._to_vtk_image(

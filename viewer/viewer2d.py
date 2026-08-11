@@ -68,7 +68,7 @@ class DicomViewer2D(QGraphicsView):
 
         self.setFrameShape(QGraphicsView.NoFrame)
         self.setRenderHint(QPainter.SmoothPixmapTransform,False)
-        self.setBackgroundBrush(QBrush(QColor("#ffffff")))
+        self.setBackgroundBrush(QBrush(QColor("#000000")))
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setMouseTracking(True)
