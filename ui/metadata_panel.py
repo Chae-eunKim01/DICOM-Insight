@@ -13,6 +13,7 @@ class MetadataPanel(QWidget):
         super().__init__(parent)
 
         self.current_ds=None
+        self.current_frame_index=None
         self._last_mode_all=None
 
         layout=QVBoxLayout(self)
@@ -80,18 +81,18 @@ class MetadataPanel(QWidget):
             count=0
         else:
             try:
-                count=sum(1 for _ in ds.iterall())
+                count=len(extract_elements(ds,self.current_frame_index))
             except Exception:
                 try:
-                    count=len(ds)
+                    count=sum(1 for _ in ds.iterall())
                 except Exception:
                     count=0
-
         self.tag_count_label.setText(f"Total Tags: {count}")
 
-    def set_dataset(self,ds):
-        self._update_tag_count(ds)
+    def set_dataset(self,ds,frame_index=None):
         self.current_ds=ds
+        self.current_frame_index=frame_index
+        self._update_tag_count(ds)
         self._refresh()
 
     def _refresh(self):
@@ -103,10 +104,10 @@ class MetadataPanel(QWidget):
             elif show_all:
                 rows=[
                     (tag_id,description,value)
-                    for tag_id,description,vr,value in extract_elements(self.current_ds)
+                    for tag_id,description,vr,value in extract_elements(self.current_ds,self.current_frame_index)
                 ]
             else:
-                rows=extract_metadata(self.current_ds)
+                rows=extract_metadata(self.current_ds,self.current_frame_index)
 
             # 모드가 같고 행 수가 같으면 기존 QTableWidgetItem을 재사용
             reuse=(

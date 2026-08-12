@@ -22,6 +22,7 @@ class ImportWorker(QObject):
         started=perf_counter()
         try:
             candidate_files=[]
+            candidate_sources={}
             seen=set()
             preview_path=""
             scan_started=perf_counter()
@@ -29,8 +30,10 @@ class ImportWorker(QObject):
             for item in self.items:
                 path=Path(item)
                 if path.is_dir():
+                    import_root=path.resolve()
                     iterator=iter_candidate_files(str(path))
                 elif path.is_file():
+                    import_root=path.resolve().parent
                     iterator=(str(path),)
                 else:
                     continue
@@ -41,6 +44,9 @@ class ImportWorker(QObject):
                         continue
                     seen.add(candidate)
                     candidate_files.append(candidate)
+                    candidate_path=Path(candidate).resolve()
+                    source_root=candidate_path.parent
+                    candidate_sources[candidate]=os.path.normcase(os.path.abspath(os.fspath(source_root)))
                     count=len(candidate_files)
                     if count==1 or count%512==0:
                         self.scan_progress.emit(count)
@@ -60,7 +66,7 @@ class ImportWorker(QObject):
             def progress(current,total,dicom_count):
                 self.index_progress.emit(current,total,dicom_count)
 
-            index,info,files=build_index_fast(candidate_files,progress_callback=progress,progress_batch=2048)
+            index,info,files=build_index_fast(candidate_files,progress_callback=progress,progress_batch=2048,source_map=candidate_sources)
             if files:
                 preview_path=files[0]
             index_elapsed=perf_counter()-index_started

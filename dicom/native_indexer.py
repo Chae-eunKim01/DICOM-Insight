@@ -17,7 +17,8 @@ _TEXT_TAGS={
     (0x0020,0x000D):"study_uid",
     (0x0020,0x000E):"series_uid",
     (0x0020,0x0011):"series_number",
-    (0x0020,0x0013):"instance_number"
+    (0x0020,0x0013):"instance_number",
+    (0x0028,0x0008):"number_of_frames"
 }
 _ESSENTIAL=("study_uid","series_uid")
 _INITIAL_READ=65536
@@ -160,6 +161,7 @@ def _parse_buffer(data,path):
         "series_number":values.get("series_number","") or "",
         "modality":values.get("modality","") or "",
         "instance_number":values.get("instance_number","") or "",
+        "number_of_frames":max(1,int(_number(values.get("number_of_frames"),1))),
         "image_position":None,
         "image_orientation":None
     }
@@ -213,7 +215,7 @@ def _worker_count(file_count):
     return min(12,max(6,cpu))
 
 
-def build_native_index(paths,progress_callback=None,progress_batch=1024,max_workers=None):
+def build_native_index(paths,progress_callback=None,progress_batch=1024,max_workers=None,source_map=None):
     paths=list(dict.fromkeys(os.fspath(path) for path in paths))
     total=len(paths)
     index=defaultdict(lambda:defaultdict(lambda:defaultdict(list)))
@@ -221,22 +223,26 @@ def build_native_index(paths,progress_callback=None,progress_batch=1024,max_work
     if not total:
         return index,info,[]
 
-    series_items=defaultdict(list)
+    parsed_items=[]
     dicom_count=0
     workers=max_workers or _worker_count(total)
+    normalized_sources={}
+    if source_map:
+        normalized_sources={
+            os.fspath(path):os.path.normcase(os.path.abspath(os.fspath(source)))
+            for path,source in source_map.items()
+        }
 
     def accept(item):
         nonlocal dicom_count
         if item is None:
             return
         dicom_count+=1
-        patient_id=item["patient_id"]
-        study_uid=item["study_uid"]
-        series_uid=item["series_uid"]
-        series_items[(patient_id,study_uid,series_uid)].append(item)
-        info.setdefault(patient_id,{"patient_name":item["patient_name"]})
-        info.setdefault(study_uid,{"study_date":item["study_date"],"study_description":item["study_description"]})
-        info.setdefault(series_uid,{"series_description":item["series_description"],"modality":item["modality"],"series_number":item["series_number"]})
+        item["source_root"]=normalized_sources.get(
+            os.fspath(item["path"]),
+            os.path.normcase(os.path.abspath(os.path.dirname(os.fspath(item["path"]))))
+        )
+        parsed_items.append(item)
 
     if workers<=1:
         for completed,path in enumerate(paths,1):
@@ -250,11 +256,55 @@ def build_native_index(paths,progress_callback=None,progress_batch=1024,max_work
                 if progress_callback and (completed==total or completed%progress_batch==0):
                     progress_callback(completed,total,dicom_count)
 
+    # Keep one Study node for the same StudyInstanceUID, even when its files
+    # come from multiple folders. Series are folder-aware so files located in
+    # different physical folders never collapse into one Series node.
+    series_items=defaultdict(list)
+    for item in parsed_items:
+        patient_id=item["patient_id"]
+        study_uid=item["study_uid"]
+        series_uid=item["series_uid"]
+        source_root=item["source_root"]
+        study_key=study_uid
+        frame_count=max(1,int(item.get("number_of_frames",1) or 1))
+        if frame_count>1:
+            # A multi-frame DICOM is treated as its own virtual Series.
+            # Multiple multi-frame files sharing the same Series UID must not
+            # be flattened into one huge 80 x 81 = 6480 slice Series.
+            # Each physical DICOM file becomes one Series whose frames behave
+            # like ordinary single-frame slices in the 2D viewer.
+            multi_frame_path=os.path.normcase(os.path.abspath(os.fspath(item["path"])))
+            series_key=(series_uid,source_root,multi_frame_path)
+        else:
+            series_key=(series_uid,source_root)
+
+        series_items[(patient_id,study_key,series_key)].append(item)
+        info.setdefault(patient_id,{"patient_name":item["patient_name"]})
+        info.setdefault(study_key,{
+            "study_uid":study_uid,
+            "study_date":item["study_date"],
+            "study_description":item["study_description"],
+            "source_root":item["source_root"]
+        })
+        info.setdefault(series_key,{
+            "series_uid":series_uid,
+            "series_description":item["series_description"],
+            "modality":item["modality"],
+            "series_number":item["series_number"],
+            "source_root":item["source_root"],
+            "multi_frame_file":os.path.basename(os.fspath(item["path"])) if frame_count>1 else "",
+            "number_of_frames":frame_count
+        })
+
     sorted_all_paths=[]
-    for (patient_id,study_uid,series_uid),series in series_items.items():
+    for (patient_id,study_key,series_key),series in series_items.items():
         series.sort(key=_file_sort_key)
-        sorted_paths=[item["path"] for item in series]
-        index[patient_id][study_uid][series_uid]=sorted_paths
-        sorted_all_paths.extend(sorted_paths)
+        sorted_paths=[]
+        for item in series:
+            frame_count=max(1,int(item.get("number_of_frames",1) or 1))
+            sorted_paths.extend([item["path"]]*frame_count)
+        index[patient_id][study_key][series_key]=sorted_paths
+        sorted_all_paths.extend(item["path"] for item in series)
 
     return index,info,sorted_all_paths
+

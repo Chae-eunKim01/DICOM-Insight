@@ -1,11 +1,13 @@
 import numpy as np
 import pydicom
 from datetime import datetime
+from html import escape
 from collections import OrderedDict
 from PySide6.QtCore import Qt,Signal,QTimer,QEvent
 from PySide6.QtGui import QImage,QPixmap,QPainter,QBrush,QColor,QTransform
 from PySide6.QtWidgets import QGraphicsView,QGraphicsScene,QGraphicsPixmapItem,QLabel
 from dicom.pixel_decoder import apply_window,get_default_window,decode_hu,is_color_dataset,normalize_color
+from dicom.frame_metadata import frame_text,frame_value
 
 
 class HoverPixmapItem(QGraphicsPixmapItem):
@@ -60,6 +62,7 @@ class DicomViewer2D(QGraphicsView):
         self.window_level=40.0
         self.default_window_width=400.0
         self.default_window_level=40.0
+        self.window_overridden=False
         self.rotation_angle=0
         self.flip_horizontal=False
         self.flip_vertical=False
@@ -75,6 +78,7 @@ class DicomViewer2D(QGraphicsView):
         self.viewport().setMouseTracking(True)
 
         self.pixel_probe_text=""
+        self.overlay_context={}
 
         self.overlay_top_left=QLabel(self.viewport())
         self.overlay_top_right=QLabel(self.viewport())
@@ -111,6 +115,18 @@ class DicomViewer2D(QGraphicsView):
         label.setText("")
         label.show()
 
+    def set_overlay_context(self,context=None):
+        self.overlay_context=dict(context or {})
+        self._update_overlays()
+
+    def current_frame_index(self):
+        if 0<=self.index<len(self.series_frame_indices):
+            return self.series_frame_indices[self.index]
+        return None
+
+    def _frame_text(self,ds,name,default="-"):
+        return frame_text(ds,name,self.current_frame_index(),default)
+
     def _safe_text(self,ds,name,default="-"):
         try:
             value=getattr(ds,name,None)
@@ -146,21 +162,20 @@ class DicomViewer2D(QGraphicsView):
         return f"{date_text} {time_text}".strip()
 
     def _slice_location_text(self,ds):
-        value=getattr(ds,"SliceLocation",None)
-
+        frame_index=self.current_frame_index()
+        value=frame_value(ds,"SliceLocation",frame_index,None)
         if value is not None:
             try:
                 return f"{float(value):.2f} mm"
             except Exception:
                 return str(value)
 
-        ipp=getattr(ds,"ImagePositionPatient",None)
+        ipp=frame_value(ds,"ImagePositionPatient",frame_index,None)
         if ipp is not None and len(ipp)>=3:
             try:
                 return f"{float(ipp[2]):.2f} mm"
             except Exception:
                 pass
-
         return "-"
 
     def _on_image_hover(self,x,y):
@@ -332,7 +347,7 @@ class DicomViewer2D(QGraphicsView):
         study_datetime=self._format_study_datetime(ds)
         manufacturer=self._safe_text(ds,"Manufacturer")
 
-        slice_thickness=self._safe_text(ds,"SliceThickness")
+        slice_thickness=self._frame_text(ds,"SliceThickness")
         try:
             slice_thickness=f"{float(slice_thickness):.2f} mm"
         except Exception:
@@ -341,10 +356,22 @@ class DicomViewer2D(QGraphicsView):
 
         slice_location=self._slice_location_text(ds)
 
-        self.overlay_top_left.setText(
-            f"{study_desc}\n"
-            f"{series_desc}"
+        patient_label=str(self.overlay_context.get("patient_label","")).strip()
+        study_color=self.overlay_context.get("study_color","#ffffff")
+        series_color=self.overlay_context.get("series_color","#ffffff")
+
+        top_left_lines=[]
+        if patient_label:
+            top_left_lines.append(
+                f'<span style="color:#ffffff;font-weight:700;">{escape(patient_label)}</span>'
+            )
+        top_left_lines.append(
+            f'<span style="color:{study_color};font-weight:700;">{escape(study_desc)}</span>'
         )
+        top_left_lines.append(
+            f'<span style="color:{series_color};font-weight:700;">{escape(series_desc)}</span>'
+        )
+        self.overlay_top_left.setText("<br>".join(top_left_lines))
 
         self.overlay_top_right.setText(
             f"{manufacturer}\n"
@@ -431,6 +458,8 @@ class DicomViewer2D(QGraphicsView):
     def clear_viewer(self):
         self.datasets=[]
         self.series_paths=[]
+        self.series_frame_indices=[]
+        self.series_frame_counts=[]
         self.dataset_cache.clear()
         self.index=0
         self.hu=None
@@ -439,44 +468,48 @@ class DicomViewer2D(QGraphicsView):
         self.scene.setSceneRect(self.pixmap_item.sceneBoundingRect())
         self._update_overlays()
 
-    def _cache_dataset(self,index,ds):
-        if index in self.dataset_cache:
-            self.dataset_cache.pop(index)
-
-        self.dataset_cache[index]=ds
-
+    def _cache_dataset(self,key,ds):
+        if key in self.dataset_cache:
+            self.dataset_cache.pop(key)
+        self.dataset_cache[key]=ds
         while len(self.dataset_cache)>self.dataset_cache_size:
             self.dataset_cache.popitem(last=False)
 
     def _read_dataset_at(self,index):
         if index<0 or index>=len(self.series_paths):
             return None
-
-        if index in self.dataset_cache:
-            ds=self.dataset_cache.pop(index)
-            self.dataset_cache[index]=ds
-            return ds
-
         path=self.series_paths[index]
-
+        key=str(path)
+        if key in self.dataset_cache:
+            ds=self.dataset_cache.pop(key)
+            self.dataset_cache[key]=ds
+            return ds
         try:
-            ds=pydicom.dcmread(
-                str(path),
-                defer_size=4096
-            )
+            ds=pydicom.dcmread(str(path),defer_size=4096)
             ds.filename=str(path)
         except Exception:
             return None
-
-        self._cache_dataset(index,ds)
+        self._cache_dataset(key,ds)
         return ds
 
     def set_series_paths(self,paths,start_index=0):
         self.datasets=[]
         self.series_paths=[str(path) for path in paths]
+        totals={}
+        for path in self.series_paths:
+            totals[path]=totals.get(path,0)+1
+        seen={}
+        self.series_frame_indices=[]
+        self.series_frame_counts=[]
+        for path in self.series_paths:
+            frame_index=seen.get(path,0)
+            seen[path]=frame_index+1
+            self.series_frame_indices.append(frame_index if totals[path]>1 else None)
+            self.series_frame_counts.append(totals[path])
         self.dataset_cache.clear()
         self.hu_cache.clear()
         self.hu=None
+        self.window_overridden=False
 
         if not self.series_paths:
             self.clear_viewer()
@@ -499,19 +532,19 @@ class DicomViewer2D(QGraphicsView):
         # Backward-compatible path for callers that already have all datasets.
         self.datasets=list(datasets)
 
-        self.series_paths=[
-            str(getattr(ds,"filename",""))
-            for ds in self.datasets
-        ]
+        self.series_paths=[str(getattr(ds,"filename","")) for ds in self.datasets]
+        self.series_frame_indices=[None]*len(self.series_paths)
+        self.series_frame_counts=[1]*len(self.series_paths)
 
         self.dataset_cache.clear()
         self.hu_cache.clear()
         self.hu=None
+        self.window_overridden=False
 
         for idx,ds in enumerate(self.datasets):
             if idx>=self.dataset_cache_size:
                 break
-            self._cache_dataset(idx,ds)
+            self._cache_dataset(str(getattr(ds,"filename",idx)),ds)
 
         if not self.series_paths:
             self.clear_viewer()
@@ -542,7 +575,10 @@ class DicomViewer2D(QGraphicsView):
             self.hu_cache[index]=hu
             return hu
 
-        hu=decode_hu(ds)
+        frame_index=None
+        if index<len(self.series_frame_indices):
+            frame_index=self.series_frame_indices[index]
+        hu=decode_hu(ds,frame_index=frame_index)
         self.hu_cache[index]=hu
 
         while len(self.hu_cache)>self.hu_cache_size:
@@ -556,10 +592,18 @@ class DicomViewer2D(QGraphicsView):
             return
         self.hu=self._get_cached_hu(self.index,ds)
 
-        if reset_window and not is_color_dataset(ds):
-            self.window_width,self.window_level=get_default_window(ds,self.hu)
-            self.default_window_width=self.window_width
-            self.default_window_level=self.window_level
+        if not is_color_dataset(ds):
+            frame_index=self.current_frame_index()
+            is_multiframe=frame_index is not None
+            if reset_window or is_multiframe:
+                default_width,default_level=get_default_window(ds,self.hu,frame_index=frame_index)
+                self.default_window_width=default_width
+                self.default_window_level=default_level
+                if reset_window or not self.window_overridden:
+                    self.window_width=default_width
+                    self.window_level=default_level
+                    if reset_window:
+                        self.window_overridden=False
 
         self._render()
         self._update_overlays()
@@ -631,6 +675,7 @@ class DicomViewer2D(QGraphicsView):
             return
         self.window_width=self.default_window_width
         self.window_level=self.default_window_level
+        self.window_overridden=False
         self._render()
 
     def set_slice(self,index):
@@ -675,6 +720,7 @@ class DicomViewer2D(QGraphicsView):
         ):
             self.window_width=max(1.0,self.window_width+dx*2.0)
             self.window_level=self.window_level+dy*2.0
+            self.window_overridden=True
             self._render()
         elif self.drag_mode_name=="zoom":
             factor=max(0.1,min(1.0+(-dy*0.01),10.0))
@@ -755,6 +801,7 @@ class DicomViewer2D(QGraphicsView):
         if not is_color_dataset(ds):
             self.window_width=float(self.default_window_width)
             self.window_level=float(self.default_window_level)
+            self.window_overridden=False
 
         # Rotate / Flip 초기화
         self.rotation_angle=0
@@ -805,6 +852,7 @@ class DicomViewer2D(QGraphicsView):
             self.reset_window_level()
             return
 
+        self.window_overridden=True
         self._render()
 
     def reset_window_level(self):

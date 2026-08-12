@@ -1,3 +1,4 @@
+from dicom.frame_metadata import frame_value,frame_group_elements
 IMPORTANT_TAGS=[
     ("(0010,0020)","Patient ID","PatientID"),
     ("(0010,0010)","Patient Name","PatientName"),
@@ -71,13 +72,16 @@ def safe_value_to_text(element):
     except Exception as e:
         return f"<Invalid value: {type(e).__name__}>"
 
-def extract_metadata(ds):
+def extract_metadata(ds,frame_index=None):
     if ds is None:
         return []
 
     rows=[]
     for tag_id,label,path in IMPORTANT_TAGS:
-        value=_nested_getattr(ds,path)
+        if "." not in path and path!="file_meta.TransferSyntaxUID":
+            value=frame_value(ds,path,frame_index,"")
+        else:
+            value=_nested_getattr(ds,path)
         try:
             value=str(value) if value is not None else ""
         except Exception:
@@ -109,36 +113,58 @@ def _safe_element_row(element):
     value=safe_value_to_text(element)
     return (tag,name,vr,value)
 
-def extract_elements(ds):
+def _append_recursive_rows(rows,ds,prefix=""):
+    try:
+        elements=list(ds)
+    except Exception:
+        return
+    for element in elements:
+        try:
+            if str(getattr(element,"VR",""))=="SQ":
+                seq_name=getattr(element,"name","") or getattr(element,"keyword","") or "Sequence"
+                for i,item in enumerate(element.value):
+                    next_prefix=f"{prefix}{seq_name}[{i+1}] > "
+                    _append_recursive_rows(rows,item,next_prefix)
+                continue
+            tag,name,vr,value=_safe_element_row(element)
+            if prefix:
+                name=prefix+name
+            rows.append((tag,name,vr,value))
+        except Exception:
+            continue
+
+
+def extract_elements(ds,frame_index=None):
     if ds is None:
         return []
 
     rows=[]
-
     try:
         file_meta=getattr(ds,"file_meta",None)
         if file_meta:
             for element in file_meta:
-                try:
-                    rows.append(_safe_element_row(element))
-                except Exception:
-                    continue
+                rows.append(_safe_element_row(element))
     except Exception:
         pass
 
+    # Top-level elements are shown once. Large functional-group sequences are
+    # represented by the Shared group + the currently displayed frame only,
+    # instead of flattening all frames into thousands of duplicated rows.
     try:
-        elements=list(ds)
-    except Exception:
-        elements=[]
-
-    for element in elements:
-        try:
-            rows.append(_safe_element_row(element))
-        except Exception:
-            try:
-                tag=f"({element.tag.group:04X},{element.tag.element:04X})"
-                rows.append((tag,"Unknown","","<Invalid element>"))
-            except Exception:
+        for element in ds:
+            keyword=str(getattr(element,"keyword","") or "")
+            if keyword in ("SharedFunctionalGroupsSequence","PerFrameFunctionalGroupsSequence"):
                 continue
+            if str(getattr(element,"VR",""))=="SQ":
+                seq_name=getattr(element,"name","") or keyword or "Sequence"
+                for i,item in enumerate(element.value):
+                    _append_recursive_rows(rows,item,f"{seq_name}[{i+1}] > ")
+            else:
+                rows.append(_safe_element_row(element))
+    except Exception:
+        pass
+
+    for group_name,group_ds in frame_group_elements(ds,frame_index):
+        _append_recursive_rows(rows,group_ds,f"{group_name} > ")
 
     return rows

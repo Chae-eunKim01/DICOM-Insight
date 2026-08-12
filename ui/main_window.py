@@ -284,9 +284,8 @@ class MainWindow(QMainWindow):
             self._apply_pending_slice_scroll
         )
         self.viewer.window_changed.connect(self._on_window_changed)
-        self.viewer.current_file_changed.connect(
-            self.series_tree.select_file_path
-        )
+        # Slice highlight is synchronized by slice index so multi-frame DICOM
+        # frames behave exactly like ordinary single-frame slices. 
 
     def _setup_slice_shortcuts(self):
         self.slice_up_shortcut=QShortcut(QKeySequence(Qt.Key_Up),self)
@@ -325,6 +324,10 @@ class MainWindow(QMainWindow):
         self.left_title.setStyleSheet("font-size:18px;")
         self.right_title.setStyleSheet("font-size:18px;")
         self.series_tree.set_theme(theme)
+        if getattr(self.viewer,"series_paths",None):
+            self.viewer.set_overlay_context(
+                self.series_tree.get_overlay_context_by_paths(self.viewer.series_paths)
+            )
 
         if save:
             self.settings.setValue("theme",theme)
@@ -700,6 +703,11 @@ class MainWindow(QMainWindow):
                     break
 
         try:
+            # DICOM Tree와 같은 Patient/Study/Series 색상 정보를 Viewer overlay에 적용한다.
+            self.viewer.set_overlay_context(
+                self.series_tree.get_overlay_context_by_paths(paths)
+            )
+
             # Lazy mode:
             # Series 전체를 dcmread하지 않고 현재 Slice 한 장만 즉시 읽는다.
             self.viewer.set_series_paths(
@@ -708,7 +716,8 @@ class MainWindow(QMainWindow):
             )
 
             self.metadata.set_dataset(
-                self.viewer.current_dataset()
+                self.viewer.current_dataset(),
+                self.viewer.current_frame_index()
             )
 
             self._update_path_from_current()
@@ -729,35 +738,16 @@ class MainWindow(QMainWindow):
                 str(e)
             )
 
-    def _on_tree_file_selected(self,paths,file_path):
-        if not file_path:
-            return
-
+    def _on_tree_file_selected(self,paths,slice_index):
         paths=[str(path) for path in paths]
-        loaded_paths=list(
-            getattr(self.viewer,"series_paths",[]) or []
-        )
-
-        def norm(value):
-            try:
-                return str(Path(value).resolve()).lower()
-            except Exception:
-                return str(value).lower()
-
-        target=norm(file_path)
-
-        if loaded_paths and [norm(p) for p in loaded_paths]==[norm(p) for p in paths]:
-            normalized=[norm(p) for p in loaded_paths]
-
-            if target in normalized:
-                self.series_tree.set_active_series_by_paths(paths)
-                self.viewer.set_slice(normalized.index(target))
-                return
-
-        self.load_series(
-            paths,
-            start_file_path=file_path
-        )
+        slice_index=max(0,min(int(slice_index),len(paths)-1))
+        loaded_paths=list(getattr(self.viewer,"series_paths",[]) or [])
+        if loaded_paths==paths:
+            self.series_tree.set_active_series_by_paths(paths)
+            self.viewer.set_slice(slice_index)
+            return
+        self.load_series(paths)
+        self.viewer.set_slice(slice_index)
 
     def _on_slice_scroll_changed(self,value):
         if not getattr(self.viewer,"series_paths",None):
@@ -807,8 +797,12 @@ class MainWindow(QMainWindow):
 
     def _on_slice_changed(self,current,total):
         self.slice_label.setText(f"Slice: {current}/{total}")
+        self.series_tree.select_slice(current-1)
         try:
-            self.metadata.set_dataset(self.viewer.current_dataset())
+            self.metadata.set_dataset(
+                self.viewer.current_dataset(),
+                self.viewer.current_frame_index()
+            )
         except Exception:
             pass
         self._update_path_from_current()
