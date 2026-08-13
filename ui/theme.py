@@ -28,9 +28,6 @@ QTableWidget{
     alternate-background-color:#f6f6f6;
     gridline-color:#dddddd;
 }
-QTableWidget::item{
-    color:#333333;
-}
 QHeaderView::section{
     background:#f3f3f3;
     color:#333333;
@@ -161,9 +158,6 @@ QTreeWidget,QTableWidget,QLineEdit{
 QTableWidget{
     alternate-background-color:#2b2b2b;
     gridline-color:#3a3a3a;
-}
-QTableWidget::item{
-    color:#e6e6e6;
 }
 QHeaderView::section{
     background:#2c2c2c;

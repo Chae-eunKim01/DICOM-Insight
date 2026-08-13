@@ -1,0 +1,16 @@
+conda activate dicom  
+
+git add .
+git commit -m "Update"
+git push
+
+git rm --cached "installer/DICOM_Insight_Setup_v1.0.0.exe"
+Add-Content .gitignore "installer/*.exe"
+git add .gitignore
+git commit --amend --no-edit
+git push
+
+
+pyinstaller --noconfirm --clean "DICOM Insight.spec"     
+pyinstaller --noconfirm --clean --windowed --name "DICOM Insight" --icon "assets\DICOM_Insight.ico" main.py
+"C:\Program Files\Inno Setup 7\ISCC.exe" "installer.iss"  

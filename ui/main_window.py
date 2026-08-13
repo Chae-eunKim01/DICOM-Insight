@@ -15,6 +15,7 @@ from viewer.viewer3d import Viewer3DDialog
 from dicom.volume_builder import inspect_series_resolution,build_volume_from_paths
 from dicom.import_worker import ImportWorker
 from dicom.loader import load_series
+from ui.acquisition_timing import AcquisitionTimingDialog
 
 def _path_key(path):
     return os.path.normcase(os.path.abspath(os.fspath(path)))
@@ -264,6 +265,11 @@ class MainWindow(QMainWindow):
         )
         menu_3d.addAction(volume_action)
 
+        self.view_menu.addSeparator()
+        timing_action=QAction("Acquisition Timing",self)
+        timing_action.triggered.connect(self.open_acquisition_timing)
+        self.view_menu.addAction(timing_action)
+
         self.view_btn.setMenu(self.view_menu)
 
         self.light_action.triggered.connect(lambda:self.apply_theme("light"))
@@ -460,6 +466,36 @@ class MainWindow(QMainWindow):
             f"Window Preset: {name}",
             2500
         )
+
+    def open_acquisition_timing(self):
+        paths=list(getattr(self.viewer,"series_paths",[]) or [])
+        if not paths:
+            QMessageBox.information(self,"Acquisition Timing","먼저 DICOM Series를 불러와 주세요.")
+            return
+        ds=self.viewer.current_dataset()
+        series_uid=""
+        series_description=""
+        if ds is not None:
+            try:
+                series_uid=str(getattr(ds,"SeriesInstanceUID","") or "")
+            except Exception:
+                pass
+            try:
+                series_description=str(getattr(ds,"SeriesDescription","") or "")
+            except Exception:
+                pass
+        frame_indices=list(getattr(self.viewer,"series_frame_indices",[]) or [])
+        if len(frame_indices)!=len(paths):
+            frame_indices=[None]*len(paths)
+        dialog=AcquisitionTimingDialog(
+            paths,
+            frame_indices=frame_indices,
+            series_uid=series_uid,
+            series_description=series_description,
+            jump_callback=self.viewer.set_slice,
+            parent=self
+        )
+        dialog.exec()
 
     def open_3d_viewer(self,mode):
         paths=list(getattr(self.viewer,"series_paths",[]) or [])

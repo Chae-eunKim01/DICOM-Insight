@@ -1,12 +1,12 @@
 [Setup]
 AppId={{8DA30B13-66A4-4B31-96EC-7B5794A00D01}
 AppName=DICOM Insight
-AppVersion=1.0.1
+AppVersion=1.0.3
 AppPublisher=Chae-eunKim01
 DefaultDirName={autopf}\DICOM Insight
 DefaultGroupName=DICOM Insight
 OutputDir=installer
-OutputBaseFilename=DICOM_Insight_Setup_v1.0.1
+OutputBaseFilename=DICOM_Insight_Setup_v1.0.3
 SetupIconFile=assets\DICOM_Insight.ico
 UninstallDisplayIcon={app}\DICOM Insight.exe
 Compression=lzma2
